@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import aiosqlite
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class Conversation:
+    user_id: int
+    topic_id: int
+    active: bool
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._conn: aiosqlite.Connection | None = None
+        self._operation_lock = asyncio.Lock()
+        self._transaction_owner: asyncio.Task[Any] | None = None
+
+    async def connect(self) -> None:
+        self._conn = await aiosqlite.connect(self._path)
+        await self._conn.execute("PRAGMA journal_mode=WAL;")
+        await self._conn.execute("PRAGMA foreign_keys=ON;")
+        await self._conn.commit()
+
+    async def close(self) -> None:
+        async with self._operation_lock:
+            if self._conn is None:
+                return
+            await self._conn.close()
+            self._conn = None
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database not connected")
+        return self._conn
+
+    @asynccontextmanager
+    async def _operation(self) -> Any:
+        if self._transaction_owner is asyncio.current_task():
+            yield
+            return
+        async with self._operation_lock:
+            yield
+
+    def _validate_commit_mode(self, *, commit: bool) -> None:
+        in_transaction = self._transaction_owner is asyncio.current_task()
+        if in_transaction and commit:
+            raise RuntimeError("Use commit=False inside Database.transaction()")
+        if not in_transaction and not commit:
+            raise RuntimeError("commit=False requires Database.transaction()")
+
+    @asynccontextmanager
+    async def _write_operation(self, *, commit: bool) -> Any:
+        self._validate_commit_mode(commit=commit)
+        async with self._operation():
+            yield
+            if commit:
+                await self.conn.commit()
+
+    @asynccontextmanager
+    async def transaction(self) -> Any:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Database.transaction() requires an asyncio task")
+        if self._transaction_owner is task:
+            raise RuntimeError("Nested Database.transaction() is not supported")
+
+        async with self._operation_lock:
+            self._transaction_owner = task
+            try:
+                await self.conn.execute("BEGIN;")
+                try:
+                    yield
+                except BaseException:
+                    await self.conn.rollback()
+                    raise
+                else:
+                    await self.conn.commit()
+            finally:
+                self._transaction_owner = None
+
+    async def init(self) -> None:
+        async with self._operation_lock:
+            await self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                  user_id      INTEGER PRIMARY KEY,
+                  username     TEXT,
+                  first_name   TEXT,
+                  last_name    TEXT,
+                  created_at   TEXT NOT NULL,
+                  updated_at   TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS conversations (
+                  user_id      INTEGER PRIMARY KEY,
+                  topic_id     INTEGER NOT NULL,
+                  active       INTEGER NOT NULL DEFAULT 1,
+                  created_at   TEXT NOT NULL,
+                  updated_at   TEXT NOT NULL,
+                  FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_conversations_topic_id
+                  ON conversations(topic_id);
+
+                CREATE TABLE IF NOT EXISTS messages (
+                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id      INTEGER NOT NULL,
+                  direction    TEXT NOT NULL,   -- 'user' or 'operator'
+                  chat_id      INTEGER NOT NULL,
+                  message_id   INTEGER NOT NULL,
+                  content_type TEXT NOT NULL,
+                  text         TEXT,
+                  caption      TEXT,
+                  file_id      TEXT,
+                  payload_json TEXT,
+                  created_at   TEXT NOT NULL,
+                  edited_at    TEXT,
+                  FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_messages_user_id_created_at
+                  ON messages(user_id, created_at);
+
+                DELETE FROM messages
+                  WHERE id NOT IN (
+                    SELECT MIN(id)
+                      FROM messages
+                     GROUP BY chat_id, message_id
+                  );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_id_message_id_unique
+                  ON messages(chat_id, message_id);
+
+                CREATE TABLE IF NOT EXISTS message_links (
+                  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id           INTEGER NOT NULL,
+                  source_chat_id    INTEGER NOT NULL,
+                  source_message_id INTEGER NOT NULL,
+                  target_chat_id    INTEGER NOT NULL,
+                  target_message_id INTEGER NOT NULL,
+                  created_at        TEXT NOT NULL,
+                  FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_message_links_source_unique
+                  ON message_links(source_chat_id, source_message_id);
+
+                CREATE INDEX IF NOT EXISTS idx_message_links_user_id
+                  ON message_links(user_id);
+
+                CREATE TABLE IF NOT EXISTS admin_bridge_deliveries (
+                  outbox_id           INTEGER PRIMARY KEY,
+                  telegram_message_id INTEGER NOT NULL,
+                  topic_message_id    INTEGER NOT NULL,
+                  delivered_at        TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS admin_bridge_events (
+                  event_id     TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  created_at   TEXT NOT NULL
+                );
+                """
+            )
+            columns_cursor = await self.conn.execute("PRAGMA table_info(messages)")
+            message_columns = {
+                str(row[1]) for row in await columns_cursor.fetchall()
+            }
+            await columns_cursor.close()
+            if "edited_at" not in message_columns:
+                await self.conn.execute(
+                    "ALTER TABLE messages ADD COLUMN edited_at TEXT"
+                )
+            await self.conn.commit()
+
+    async def upsert_user(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        last_name: Optional[str],
+        *,
+        commit: bool = True,
+    ) -> None:
+        now = _now_iso()
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  username=excluded.username,
+                  first_name=excluded.first_name,
+                  last_name=excluded.last_name,
+                  updated_at=excluded.updated_at
+                """,
+                (user_id, username, first_name, last_name, now, now),
+            )
+
+    async def get_active_conversation(self, user_id: int) -> Conversation | None:
+        async with self._operation():
+            cur = await self.conn.execute(
+                "SELECT user_id, topic_id, active FROM conversations WHERE user_id = ?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        if not row:
+            return None
+        conversation = Conversation(user_id=int(row[0]), topic_id=int(row[1]), active=bool(row[2]))
+        if not conversation.active:
+            return None
+        return conversation
+
+    async def set_conversation(
+        self,
+        user_id: int,
+        topic_id: int,
+        active: bool = True,
+        *,
+        commit: bool = True,
+    ) -> None:
+        now = _now_iso()
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                """
+                INSERT INTO conversations (user_id, topic_id, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  topic_id=excluded.topic_id,
+                  active=excluded.active,
+                  updated_at=excluded.updated_at
+                """,
+                (user_id, topic_id, 1 if active else 0, now, now),
+            )
+
+    async def deactivate_conversation(self, user_id: int, *, commit: bool = True) -> None:
+        now = _now_iso()
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                "UPDATE conversations SET active=0, updated_at=? WHERE user_id=?",
+                (now, user_id),
+            )
+
+    async def find_user_id_by_topic(self, topic_id: int) -> int | None:
+        async with self._operation():
+            cur = await self.conn.execute(
+                "SELECT user_id FROM conversations WHERE topic_id = ? AND active = 1",
+                (topic_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        return int(row[0]) if row else None
+
+    async def log_message(
+        self,
+        *,
+        user_id: int,
+        direction: str,
+        chat_id: int,
+        message_id: int,
+        content_type: str,
+        text: str | None,
+        caption: str | None,
+        file_id: str | None,
+        payload_json: str | None,
+        commit: bool = True,
+    ) -> None:
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                """
+                INSERT INTO messages (
+                  user_id, direction, chat_id, message_id, content_type,
+                  text, caption, file_id, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO NOTHING
+                """,
+                (
+                    user_id,
+                    direction,
+                    chat_id,
+                    message_id,
+                    content_type,
+                    text,
+                    caption,
+                    file_id,
+                    payload_json,
+                    _now_iso(),
+                ),
+            )
+
+    async def log_message_link(
+        self,
+        *,
+        user_id: int,
+        source_chat_id: int,
+        source_message_id: int,
+        target_chat_id: int,
+        target_message_id: int,
+        commit: bool = True,
+    ) -> None:
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                """
+                INSERT INTO message_links (
+                  user_id, source_chat_id, source_message_id,
+                  target_chat_id, target_message_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_chat_id, source_message_id) DO NOTHING
+                """,
+                (
+                    user_id,
+                    source_chat_id,
+                    source_message_id,
+                    target_chat_id,
+                    target_message_id,
+                    _now_iso(),
+                ),
+            )
+
+    async def update_logged_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        content_type: str,
+        text: str | None,
+        caption: str | None,
+        file_id: str | None,
+        payload_json: str | None,
+    ) -> None:
+        async with self._write_operation(commit=True):
+            await self.conn.execute(
+                """
+                UPDATE messages
+                   SET content_type = ?,
+                       text = ?,
+                       caption = ?,
+                       file_id = ?,
+                       payload_json = ?,
+                       edited_at = ?
+                 WHERE chat_id = ? AND message_id = ?
+                """,
+                (
+                    content_type,
+                    text,
+                    caption,
+                    file_id,
+                    payload_json,
+                    _now_iso(),
+                    chat_id,
+                    message_id,
+                ),
+            )
+
+    async def find_linked_message_id(
+        self,
+        *,
+        source_chat_id: int,
+        source_message_id: int,
+        target_chat_id: int | None = None,
+    ) -> int | None:
+        async with self._operation():
+            if target_chat_id is None:
+                cur = await self.conn.execute(
+                    """
+                    SELECT target_message_id
+                      FROM message_links
+                     WHERE source_chat_id = ? AND source_message_id = ?
+                    """,
+                    (source_chat_id, source_message_id),
+                )
+            else:
+                cur = await self.conn.execute(
+                    """
+                    SELECT target_message_id
+                      FROM message_links
+                     WHERE source_chat_id = ? AND source_message_id = ? AND target_chat_id = ?
+                    """,
+                    (source_chat_id, source_message_id, target_chat_id),
+                )
+            row = await cur.fetchone()
+            await cur.close()
+        return int(row[0]) if row else None
+
+    async def log_user_message(
+        self,
+        *,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        last_name: Optional[str],
+        direction: str,
+        chat_id: int,
+        message_id: int,
+        content_type: str,
+        text: str | None,
+        caption: str | None,
+        file_id: str | None,
+        payload_json: str | None,
+    ) -> None:
+        async with self.transaction():
+            await self.upsert_user(
+                user_id=user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                commit=False,
+            )
+            await self.log_message(
+                user_id=user_id,
+                direction=direction,
+                chat_id=chat_id,
+                message_id=message_id,
+                content_type=content_type,
+                text=text,
+                caption=caption,
+                file_id=file_id,
+                payload_json=payload_json,
+                commit=False,
+            )
+
+    async def upsert_admin_bridge_event(
+        self,
+        *,
+        event_id: str,
+        payload_json: str,
+    ) -> None:
+        async with self._write_operation(commit=True):
+            await self.conn.execute(
+                """
+                INSERT INTO admin_bridge_events (event_id, payload_json, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                  payload_json = excluded.payload_json
+                """,
+                (event_id, payload_json, _now_iso()),
+            )
+
+    async def list_admin_bridge_events(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[tuple[str, str]]:
+        async with self._operation():
+            cursor = await self.conn.execute(
+                """
+                SELECT event_id, payload_json
+                  FROM admin_bridge_events
+                 ORDER BY created_at ASC
+                 LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
+    async def delete_admin_bridge_event(self, event_id: str) -> None:
+        async with self._write_operation(commit=True):
+            await self.conn.execute(
+                "DELETE FROM admin_bridge_events WHERE event_id = ?",
+                (event_id,),
+            )
+
+    async def find_admin_bridge_delivery(
+        self,
+        outbox_id: int,
+    ) -> tuple[int, int] | None:
+        async with self._operation():
+            cursor = await self.conn.execute(
+                """
+                SELECT telegram_message_id, topic_message_id
+                  FROM admin_bridge_deliveries
+                 WHERE outbox_id = ?
+                """,
+                (outbox_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return None
+        return int(row[0]), int(row[1])
+
+    async def record_admin_bridge_delivery(
+        self,
+        *,
+        outbox_id: int,
+        telegram_message_id: int,
+        topic_message_id: int,
+        commit: bool = True,
+    ) -> None:
+        async with self._write_operation(commit=commit):
+            await self.conn.execute(
+                """
+                INSERT INTO admin_bridge_deliveries (
+                  outbox_id, telegram_message_id, topic_message_id, delivered_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(outbox_id) DO NOTHING
+                """,
+                (
+                    outbox_id,
+                    telegram_message_id,
+                    topic_message_id,
+                    _now_iso(),
+                ),
+            )
+
+    async def healthcheck(self) -> dict[str, Any]:
+        async with self._operation():
+            cur = await self.conn.execute("SELECT 1;")
+            row = await cur.fetchone()
+            await cur.close()
+        return {"ok": row == (1,)}
