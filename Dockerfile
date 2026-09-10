@@ -12,4 +12,4 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["uvicorn", "support_bot.omnichannel.api_main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "support_bot"]
